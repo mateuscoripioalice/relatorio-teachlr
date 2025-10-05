@@ -1,4 +1,4 @@
-# main/streamlit_app.py
+# streamlit_app.py
 import os, re, sys, time, asyncio
 from pathlib import Path
 
@@ -43,7 +43,7 @@ def search_courses(query: str, limit: int = 50):
     return [{"id": int(c.get("id")), "title": c.get("title") or "(sem título)"} for c in items]
 
 async def robust_login_hash(page, base_app: str, email: str, password: str, out_dir: Path) -> None:
-    # Se já está logado (cookies), muitas vezes o dashboard abre direto
+    # Tenta dashboard direto (cookies salvos)
     await page.goto(f"{base_app}#dashboard/", wait_until="domcontentloaded")
     try:
         await page.wait_for_url(re.compile(r".*/#dashboard/.*"), timeout=4000)
@@ -86,7 +86,6 @@ async def robust_login_hash(page, base_app: str, email: str, password: str, out_
             break
         except: continue
     if not ok:
-        # artefatos
         out_dir.mkdir(exist_ok=True)
         await page.screenshot(path=str(out_dir / "debug_login.png"), full_page=True)
         (out_dir / "debug_login.html").write_text(await page.content(), encoding="utf-8")
@@ -114,8 +113,68 @@ def should_block(req: Request) -> bool:
     url = req.url.lower()
     if any(h in url for h in BLOCK_HOSTS): return True
     if any(url.endswith(ext) for ext in BLOCK_EXT): return True
-    # permite CSS/JS e chamadas XHR/fetch (necessário pra SPA)
     return False
+
+# ----------------------------------
+# Util: achar botão "Desempenho dos estudantes" com variações
+# ----------------------------------
+BUTTON_VARIANTS = [
+    r"Desempenho dos estudantes",
+    r"Desempenho",
+    r"Relatório de desempenho",
+    r"Relatórios",
+    r"Performance",
+    r"Student.*Performance",
+    r"Performance.*Student",
+]
+
+async def click_students_performance(page, out_dir: Path):
+    # 1) tenta botão direto com has-text
+    for pat in BUTTON_VARIANTS:
+        try:
+            await page.locator(f'button:has-text("{pat}")').first.click(timeout=1200)
+            return
+        except: pass
+
+    # 2) tenta por role=button com regex no nome
+    for pat in BUTTON_VARIANTS:
+        try:
+            await page.get_by_role("button", name=re.compile(pat, re.I)).first.click(timeout=1200)
+            return
+        except: pass
+
+    # 3) qualquer elemento com esse texto
+    for pat in BUTTON_VARIANTS:
+        try:
+            await page.get_by_text(re.compile(pat, re.I), exact=False).first.click(timeout=1200)
+            return
+        except: pass
+
+    # 4) força via JS: clica no primeiro nó visível que contenha o texto
+    code = """
+    (texts) => {
+      function visible(el){
+        const rect = el.getBoundingClientRect();
+        return !!(rect.width && rect.height);
+      }
+      for (const t of texts){
+        const xpath = `//*[contains(translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÀÃÂÉÊÍÓÔÕÚÇ','abcdefghijklmnopqrstuvwxyzáàãâéêíóôõúç'), "${t.toLowerCase()}")]`;
+        const res = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        for (let i=0; i<res.snapshotLength; i++){
+          const el = res.snapshotItem(i);
+          if (visible(el)) { el.scrollIntoView({behavior:'instant', block:'center'}); el.click(); return true; }
+        }
+      }
+      return false;
+    }
+    """
+    found = await page.evaluate(code, BUTTON_VARIANTS)
+    if found: 
+        return
+
+    # Se nada deu certo, salva screenshot e erra
+    await page.screenshot(path=str(out_dir / "debug_students.png"), full_page=True)
+    raise RuntimeError('Não achei "Desempenho dos estudantes". Veja downloads/debug_students.png')
 
 # ----------------------------------
 # Fluxo principal
@@ -130,11 +189,9 @@ async def generate_and_download_report_from_students_url(
     clica 'Gerar novo relatório' antes. Baixa o arquivo e retorna o caminho.
     """
     out_dir = Path("./downloads"); out_dir.mkdir(exist_ok=True)
-    profile_dir = "/tmp/teachlr_profile"
     state_path = Path("/tmp/state.json")
 
     async with async_playwright() as p:
-        # Perfil persistente → cookies/sessão sobrevivem durante o uptime
         browser = await p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--disable-background-networking", "--disable-background-timer-throttling",
@@ -145,13 +202,10 @@ async def generate_and_download_report_from_students_url(
             viewport={"width": 1280, "height": 900}
         )
 
-        # Bloqueio de recursos
         async def router(route: Route, request: Request):
             try:
-                if should_block(request):
-                    await route.abort()
-                else:
-                    await route.continue_()
+                if should_block(request): await route.abort()
+                else: await route.continue_()
             except Exception:
                 try: await route.continue_()
                 except: pass
@@ -162,37 +216,34 @@ async def generate_and_download_report_from_students_url(
         try:
             # Login (rápido se storage_state válido)
             await robust_login_hash(page, BASE_APP, LOGIN, PASSWORD, out_dir)
-            # Salva storage_state para próximos runs
-            try:
-                await context.storage_state(path=str(state_path))
+            try: await context.storage_state(path=str(state_path))
             except: pass
 
             # Vai para a aba Estudantes
             await page.goto(students_url, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
+            try: await page.wait_for_load_state("networkidle", timeout=8000)
             except: pass
 
-            # Garante acesso ao botão
+            # Garante estar na seção certa (às vezes precisa clicar na aba "Estudantes")
             try:
-                await page.wait_for_selector('text="Desempenho dos estudantes"', timeout=7000)
+                await page.wait_for_selector('text="Desempenho dos estudantes"', timeout=3000)
             except PWTimeout:
                 try:
-                    await page.click('text=/^Estudantes$/', timeout=2000)
-                    await page.wait_for_selector('text="Desempenho dos estudantes"', timeout=6000)
-                except PWTimeout:
-                    await page.screenshot(path=str(out_dir / "debug_students.png"), full_page=True)
-                    raise RuntimeError('Não achei "Desempenho dos estudantes". Veja downloads/debug_students.png')
+                    await page.click('text=/^Estudantes$/', timeout=1500)
+                    await page.wait_for_timeout(500)
+                except: pass
 
-            # Abre modal
-            await page.click('text="Desempenho dos estudantes"')
+            # Abre modal de desempenho (com vários fallbacks)
+            await click_students_performance(page, out_dir)
+
+            # Modal helper
             def modal():
                 return page.locator('[role="dialog"], .modal, .v-dialog').first
 
-            # Modo rápido: tenta baixar direto se já houver relatório
+            # Modo rápido: tenta Baixar direto
             if not force_generate:
                 try:
-                    btn = modal().get_by_role("button", name=re.compile(r"Baixar", re.I))
+                    btn = modal().get_by_role("button", name=re.compile(r"Baixar|Download", re.I))
                     await btn.wait_for(timeout=4000)
                     async with page.expect_download(timeout=25000) as dl_info:
                         await btn.click()
@@ -205,28 +256,27 @@ async def generate_and_download_report_from_students_url(
                     await download.save_as(save_as)
                     return save_as
                 except PWTimeout:
-                    pass  # sem relatório pronto, cai no fluxo de gerar
-
-            # Se chegou aqui, gera novo
-            try:
-                await modal().get_by_role("button", name=re.compile(r"Gerar novo relatório", re.I)).click(timeout=3000)
-            except PWTimeout:
-                # Alguns temas mostram "Gerar" simples
-                try:
-                    await modal().get_by_role("button", name=re.compile(r"Gerar", re.I)).click(timeout=3000)
-                except PWTimeout:
                     pass
+
+            # Gera novo relatório
+            try:
+                await modal().get_by_role("button", name=re.compile(r"Gerar novo relatório|Gerar|Generate", re.I)).click(timeout=4000)
+            except PWTimeout:
+                # às vezes é um link estilizado
+                try:
+                    await modal().get_by_text(re.compile(r"Gerar", re.I), exact=False).first.click(timeout=2500)
+                except: pass
 
             # Loop até aparecer "Baixar"
             start = time.time()
             while time.time() - start < max_wait_sec:
                 try:
-                    # Atualiza, se existir
+                    # Atualiza se tiver
                     try:
                         await modal().locator('button[title*="Atualizar"], button:has(svg)').first.click(timeout=800)
                     except: pass
 
-                    btn = modal().get_by_role("button", name=re.compile(r"Baixar", re.I))
+                    btn = modal().get_by_role("button", name=re.compile(r"Baixar|Download", re.I))
                     await btn.wait_for(timeout=3500)
                     async with page.expect_download(timeout=25000) as dl_info:
                         await btn.click()
@@ -240,7 +290,7 @@ async def generate_and_download_report_from_students_url(
                     await download.save_as(save_as)
                     return save_as
                 except PWTimeout:
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_timeout(1200)
 
             await page.screenshot(path=str(out_dir / "debug_wait_baixar.png"), full_page=True)
             raise RuntimeError("Não apareceu o botão 'Baixar' a tempo. Veja downloads/debug_wait_baixar.png")
@@ -297,7 +347,8 @@ def show_debug():
         p = Path(dbg)
         if p.exists():
             if p.suffix == ".png":
-                st.image(str(p), caption=p.name, use_container_width=True)
+                # Removido use_container_width (sua versão do Streamlit não aceita)
+                st.image(str(p), caption=p.name)
             else:
                 with open(p, "rb") as f:
                     st.download_button(f"Baixar {p.name}", f, file_name=p.name)
@@ -310,7 +361,6 @@ if dry:
         try:
             with st.status("Testando login…", expanded=True) as status:
                 async def _test():
-                    # Reaproveita a função principal só até login
                     out_dir = Path("./downloads"); out_dir.mkdir(exist_ok=True)
                     async with async_playwright() as p:
                         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
