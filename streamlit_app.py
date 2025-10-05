@@ -3,11 +3,12 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, List
 
 import streamlit as st
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Request
 
+# ---------------------- Config da página ----------------------
 st.set_page_config(page_title="Teachlr | Relatório de Estudantes", page_icon="📄")
 
 BASE_APP = "https://alice.teachlr.com/"
@@ -22,11 +23,12 @@ PASSWORD = st.secrets.get("TEACHLR_PASSWORD", os.getenv("TEACHLR_PASSWORD", ""))
 DOWNLOAD_DIR = Path("./downloads"); DOWNLOAD_DIR.mkdir(exist_ok=True)
 STATE_PATH = Path("/tmp/state_teachlr.json")
 
-# Bloqueie só mídia pesada; não bloqueie JS/CSS
+# ---------------------- Filtro de rede ----------------------
 BLOCK_EXT = (".png",".jpg",".jpeg",".gif",".webp",".svg",".mp4",".webm",".woff",".woff2",".ttf",".otf",".eot")
 def should_block(req: Request) -> bool:
     return any(req.url.lower().endswith(ext) for ext in BLOCK_EXT)
 
+# ---------------------- Debug helpers ----------------------
 def show_debug():
     dbg = sorted(DOWNLOAD_DIR.glob("debug_*"))
     if not dbg: return
@@ -38,22 +40,30 @@ def show_debug():
             with open(p, "rb") as f:
                 st.download_button(f"Baixar {p.name}", f, file_name=p.name)
 
-# ---------- util: garantir chromium instalado ----------
+def save_dom_dump(page, png_name: str, html_name: str):
+    try:
+        page.screenshot(path=str(DOWNLOAD_DIR / png_name), full_page=True)
+    except Exception:
+        pass
+    try:
+        (DOWNLOAD_DIR / html_name).write_text(asyncio.get_event_loop().run_until_complete(page.content()), encoding="utf-8")
+    except Exception:
+        pass
+
+# ---------------------- Garantir browser ----------------------
 def ensure_playwright_installed(log):
     try:
-        # checa se já há um browser baixado
         from playwright.___impl._driver import compute_driver_executable
-        _ = compute_driver_executable()  # só força import; se falhar, instala
+        _ = compute_driver_executable()
     except Exception:
-        log.write("🧩 Instalando Chromium do Playwright (primeira execução)...")
-        # instala com dependências (seguro na Cloud)
+        log.write("🧩 Instalando Chromium do Playwright (primeira execução)…")
         subprocess.run(
             ["python", "-m", "playwright", "install", "--with-deps", "chromium"],
             check=False, capture_output=True
         )
         log.write("✅ Chromium instalado (ou já presente).")
 
-# ---------- login apenas se necessário ----------
+# ---------------------- Login se necessário ----------------------
 async def login_if_needed(page, email: str, password: str, log) -> None:
     on_signin = bool(re.search(r"/#signin", page.url))
     if not on_signin:
@@ -112,58 +122,215 @@ async def login_if_needed(page, email: str, password: str, log) -> None:
     await page.wait_for_load_state("domcontentloaded")
     log.write("✅ Login submetido.")
 
-# ---------- UI actions ----------
+# ---------------------- Ações da UI ----------------------
 async def open_reports_modal(page, log):
     log.write("📄 Abrindo modal “Desempenho dos estudantes”…")
     try:
         btn = page.get_by_role("button", name=re.compile(r"Desempenho dos estudantes", re.I))
-        await btn.first.wait_for(timeout=8000)
+        await btn.first.wait_for(timeout=10000)
         await btn.first.click()
         return
     except:
         pass
     try:
-        await page.get_by_text(re.compile(r"Desempenho dos estudantes", re.I)).first.click(timeout=6000)
+        await page.get_by_text(re.compile(r"Desempenho dos estudantes", re.I)).first.click(timeout=8000)
         return
     except:
         await page.screenshot(path=str(DOWNLOAD_DIR / "debug_students.png"), full_page=True)
         (DOWNLOAD_DIR / "debug_students.html").write_text(await page.content(), encoding="utf-8")
         raise RuntimeError('Não achei "Desempenho dos estudantes". Veja downloads/debug_students.*')
 
-async def click_generate_new_report(page, log):
+def dialog_scope(page):
+    # tenta achar o dialog pelo título "Relatórios"
+    try:
+        dlg = page.get_by_role("dialog", name=re.compile(r"Relat[oó]rios", re.I))
+        return dlg
+    except:
+        return page.locator('div[role="dialog"]')
+
+def report_rows_locator(page):
+    # linhas do grid dentro do modal
+    dlg = dialog_scope(page)
+    # tenta tbody > tr; se não houver, pega os "rows" visíveis
+    loc = dlg.locator("tbody tr")
+    return loc if loc else dlg.locator('[role="row"]')
+
+def report_action_buttons_locator(page):
+    # botões na coluna Arquivo (Processando / Baixar)
+    dlg = dialog_scope(page)
+    return dlg.get_by_role("button", name=re.compile(r"(Processando|Baixar)", re.I))
+
+async def snapshot_buttons(page) -> Tuple[int, List[str]]:
+    btns = report_action_buttons_locator(page)
+    try:
+        count = await btns.count()
+    except:
+        count = 0
+    texts: List[str] = []
+    for i in range(count):
+        try:
+            texts.append((await btns.nth(i).inner_text()).strip())
+        except:
+            texts.append("")
+    return count, texts
+
+async def click_generate_new_report(page, log) -> Tuple[bool, Optional[int]]:
+    """
+    Clica em "Gerar novo relatório" e retorna:
+    (clicked, index_btn_gerado)
+    - clicked: True se conseguiu clicar
+    - index_btn_gerado: índice do novo botão/linha (para segui-lo)
+    """
     log.write("🧮 Clicando “Gerar novo relatório”…")
+
+    # snapshot antes: quantidade e textos dos botões
+    before_count, before_texts = await snapshot_buttons(page)
+
     for sel in [
         'button:has-text("Gerar novo relatório")',
         'text=/^Gerar novo relatório$/i',
         'role=button[name="Gerar novo relatório"]',
     ]:
         try:
-            await page.locator(sel).first.click(timeout=4000)
-            log.write("✅ Solicitação de geração enviada.")
-            return
-        except: pass
-    log.write("ℹ️ Não encontrei o botão “Gerar novo relatório” (seguindo para baixar o existente).")
+            await page.locator(sel).first.click(timeout=5000)
+            log.write("✅ Solicitação enviada. Aguardando o novo item aparecer…")
+            break
+        except:
+            continue
+    else:
+        log.write("ℹ️ Não encontrei “Gerar novo relatório”. Tentarei baixar um existente.")
+        return False, None
 
-async def wait_and_download_latest(page, max_wait_sec: int, log) -> str:
-    log.write("⏳ Aguardando botão “Baixar”…")
+    # Aguarda surgir um novo botão "Processando" (ou aumentar a contagem)
+    # Damos até 60s para a linha aparecer
+    elapsed = 0
+    while elapsed < 60000:
+        await page.wait_for_timeout(1000)
+        after_count, after_texts = await snapshot_buttons(page)
+        if after_count > before_count:
+            # novo índice é o último (assumindo que entra no final)
+            return True, after_count - 1
+
+        # Mesmo count, mas apareceu um "Processando" que não havia antes
+        if "Processando" in [t.capitalize() for t in after_texts] and after_texts != before_texts:
+            # pega o índice do "Processando" mais à direita/embaixo
+            idx = None
+            for i in range(len(after_texts) - 1, -1, -1):
+                if re.search(r"Processando", after_texts[i], re.I):
+                    idx = i; break
+            if idx is not None:
+                return True, idx
+
+        elapsed += 1000
+
+    # Não apareceu; vamos tentar mesmo assim baixar o mais recente que estiver habilitado
+    log.write("⚠️ Novo item não apareceu no tempo esperado; vou tentar baixar o mais recente disponível.")
+    return True, None
+
+async def wait_and_download_same_button(page, target_index: Optional[int], max_wait_sec: int, log) -> str:
+    """
+    Se target_index for fornecido, seguimos *aquele* botão específico
+    (o que estava em "Processando"). Esperamos virar "Baixar" e habilitar.
+    Caso contrário, baixamos o *primeiro habilitado* (fallback).
+    """
+    log.write("⏳ Aguardando relatório ficar pronto…")
+
+    # helper: refresh do modal (ícone de setas)
+    async def click_refresh_if_available():
+        dlg = dialog_scope(page)
+        for sel in [
+            'button[aria-label*="Atualizar" i]',
+            'button[title*="Atualizar" i]',
+        ]:
+            try:
+                btn = dlg.locator(sel).first
+                if await btn.is_visible():
+                    await btn.click(timeout=1000)
+                    return True
+            except:
+                pass
+        return False
+
+    poll_ms = 2000
+    elapsed = 0
+
+    btns = report_action_buttons_locator(page)
+    # garante que haja pelo menos algum botão na tela
     try:
-        await page.get_by_role("button", name=re.compile(r"Baixar", re.I)).first.wait_for(timeout=max_wait_sec*1000)
+        await btns.first.wait_for(timeout=20000)
     except PWTimeout:
-        await page.screenshot(path=str(DOWNLOAD_DIR / "debug_modal_timeout.png"), full_page=True)
-        (DOWNLOAD_DIR / "debug_modal_timeout.html").write_text(await page.content(), encoding="utf-8")
-        raise RuntimeError("Demorou demais esperando “Baixar”. Veja downloads/debug_modal_timeout.*")
+        await page.screenshot(path=str(DOWNLOAD_DIR / "debug_modal_no_buttons.png"), full_page=True)
+        (DOWNLOAD_DIR / "debug_modal_no_buttons.html").write_text(await page.content(), encoding="utf-8")
+        raise RuntimeError("Não encontrei botões de ação no modal. Veja downloads/debug_modal_no_buttons.*")
 
-    dl_button = page.get_by_role("button", name=re.compile(r"Baixar", re.I)).first
-    log.write("⬇️ Iniciando download…")
-    download = await page.expect_download(timeout=60000)
-    await dl_button.click()
-    suggested = download.suggested_filename or "relatorio_teachlr.xlsx"
-    final_path = DOWNLOAD_DIR / suggested
-    await download.save_as(str(final_path))
-    log.write(f"✅ Download salvo: {final_path.name}")
-    return str(final_path)
+    while elapsed < max_wait_sec * 1000:
+        try:
+            count = await btns.count()
+            if count == 0:
+                # lista vazia? tenta refresh
+                if (elapsed // 10000) != ((elapsed + poll_ms) // 10000):
+                    await click_refresh_if_available()
+            else:
+                target_i = target_index if (target_index is not None and target_index < count) else 0
+                target = btns.nth(target_i)
 
-# ---------- fluxo principal ----------
+                # lê o texto e estado
+                txt = ""
+                try:
+                    txt = (await target.inner_text()).strip()
+                except:
+                    pass
+                enabled = False
+                try:
+                    enabled = await target.is_enabled()
+                except:
+                    pass
+
+                # se já está "Baixar" e habilitado, baixa!
+                if re.search(r"Baixar", txt, re.I) and enabled:
+                    log.write("⬇️ Iniciando download do item gerado…")
+                    download = await page.expect_download(timeout=60000)
+                    await target.click()
+                    suggested = download.suggested_filename or "relatorio_teachlr.xlsx"
+                    final_path = DOWNLOAD_DIR / suggested
+                    await download.save_as(str(final_path))
+                    log.write(f"✅ Download salvo: {final_path.name}")
+                    return str(final_path)
+
+                # se ainda "Processando", só espera/pinga refresh às vezes
+                if re.search(r"Processando", txt, re.I) or not enabled:
+                    if (elapsed // 10000) != ((elapsed + poll_ms) // 10000):
+                        await click_refresh_if_available()
+                else:
+                    # fallback: se não conseguimos identificar o mesmo,
+                    # tenta encontrar o primeiro "Baixar" habilitado
+                    for i in range(count):
+                        b = btns.nth(i)
+                        try:
+                            b_txt = (await b.inner_text()).strip()
+                            if re.search(r"Baixar", b_txt, re.I) and await b.is_enabled():
+                                log.write("⬇️ Iniciando download do mais recente habilitado…")
+                                download = await page.expect_download(timeout=60000)
+                                await b.click()
+                                suggested = download.suggested_filename or "relatorio_teachlr.xlsx"
+                                final_path = DOWNLOAD_DIR / suggested
+                                await download.save_as(str(final_path))
+                                log.write(f"✅ Download salvo: {final_path.name}")
+                                return str(final_path)
+                        except:
+                            continue
+
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+
+    await page.screenshot(path=str(DOWNLOAD_DIR / "debug_report_wait_timeout.png"), full_page=True)
+    (DOWNLOAD_DIR / "debug_report_wait_timeout.html").write_text(await page.content(), encoding="utf-8")
+    raise RuntimeError("Tempo esgotado aguardando o relatório ficar pronto. Veja downloads/debug_report_wait_timeout.*")
+
+# ---------------------- Fluxo principal ----------------------
 async def run_flow(students_url: str, force_generate: bool, email: str, password: str, log) -> str:
     ensure_playwright_installed(log)
 
@@ -180,7 +347,7 @@ async def run_flow(students_url: str, force_generate: bool, email: str, password
             storage_state=str(STATE_PATH) if STATE_PATH.exists() else None,
             viewport={"width": 1366, "height": 900},
         )
-        context.set_default_timeout(20000)      # 20s padrão
+        context.set_default_timeout(20000)
         context.set_default_navigation_timeout(30000)
 
         async def router(route, request):
@@ -209,10 +376,15 @@ async def run_flow(students_url: str, force_generate: bool, email: str, password
                 except: pass
 
             await open_reports_modal(page, log)
-            if force_generate:
-                await click_generate_new_report(page, log)
 
-            saved = await wait_and_download_latest(page, max_wait_sec=240, log=log)
+            clicked_generate = False
+            target_index = None
+            if force_generate:
+                clicked_generate, target_index = await click_generate_new_report(page, log)
+
+            # Se gerou agora, dá mais tempo (até 8 min). Senão, 2 min.
+            max_wait = 480 if clicked_generate else 120
+            saved = await wait_and_download_same_button(page, target_index, max_wait_sec=max_wait, log=log)
 
             try:
                 await context.storage_state(path=str(STATE_PATH))
@@ -224,7 +396,7 @@ async def run_flow(students_url: str, force_generate: bool, email: str, password
             await context.close()
             await browser.close()
 
-# ---------- UI ----------
+# ---------------------- UI ----------------------
 st.title("📄 Teachlr – Relatório de Desempenho dos Estudantes")
 with st.sidebar:
     st.subheader("Configuração")
