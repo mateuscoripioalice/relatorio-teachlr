@@ -146,15 +146,15 @@ async def generate_and_download_report_from_students_url(students_url: str, max_
 
         # Garante que o botão está visível
         perf_btn = 'button:has-text("Desempenho dos estudantes"), text=/Desempenho dos estudantes/i'
-        try:
-            await page.wait_for_selector(perf_btn, timeout=15000)
-        except:
-            # clica na tab Estudantes se necessário
-            try:
-                await page.click('text=/^Estudantes$/', timeout=3000)
-            except:
-                pass
-            await page.wait_for_selector(perf_btn, timeout=15000)
+        # primeiro tenta com has-text
+try:
+    await page.wait_for_selector('button:has-text("Desempenho dos estudantes")', timeout=10000)
+    await page.click('button:has-text("Desempenho dos estudantes")')
+except PWTimeout:
+    # fallback: qualquer elemento com esse texto
+    await page.wait_for_selector('text="Desempenho dos estudantes"', timeout=10000)
+    await page.click('text="Desempenho dos estudantes"')
+
 
         # Abre o modal de relatórios
         await page.click(perf_btn)
