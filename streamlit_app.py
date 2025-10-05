@@ -43,70 +43,150 @@ def search_courses(query: str, limit: int = 50):
     return [{"id": int(c.get("id")), "title": c.get("title") or "(sem título)"} for c in items]
 
 async def robust_login_hash(page, base_app: str, email: str, password: str, out_dir: Path) -> None:
-    # Tenta dashboard direto (cookies salvos)
-    await page.goto(f"{base_app}#dashboard/", wait_until="domcontentloaded")
+    """
+    Garante sessão logada. Tenta reaproveitar cookies indo direto ao dashboard; se não,
+    faz login por e-mail/senha na #signin. Procura campos também dentro de iframes e
+    tem fallback via JS.
+    """
+    # 1) tenta usar sessão existente
     try:
-        await page.wait_for_url(re.compile(r".*/#dashboard/.*"), timeout=4000)
+        await page.goto(f"{base_app}#dashboard/", wait_until="domcontentloaded")
+        await page.wait_for_url(re.compile(r".*/#dashboard/.*"), timeout=3500)
         return
     except:
         pass
 
-    # Vai pro signin
+    # 2) vai para a página de login
     await page.goto(f"{base_app}#signin", wait_until="domcontentloaded")
+    try:
+        await page.wait_for_load_state("networkidle", timeout=6000)
+    except: 
+        pass
 
-    # Fecha banners comuns
-    for sel in [
-        'button:has-text("Aceitar")',
-        'button:has-text("Accept")',
-        '[data-testid="cookie"] button',
-    ]:
-        try: await page.locator(sel).click(timeout=600)
-        except: pass
+    # util: varredura em page e em iframes
+    async def find_in_all_contexts(selectors, by="css"):
+        pages = [page, *page.frames]
+        for ctx in pages:
+            for sel in selectors:
+                try:
+                    loc = (ctx.locator(sel) if by=="css" else
+                           ctx.get_by_label(sel) if by=="label" else
+                           ctx.get_by_placeholder(sel))
+                    await loc.first.wait_for(timeout=1500)
+                    return loc.first
+                except: 
+                    continue
+        return None
 
-    # Campos (placeholders PT-BR + fallbacks)
-    email_locators = [
-        page.get_by_placeholder("Usuário ou e-mail"),
-        page.locator('input[placeholder*="e-mail" i]'),
-        page.locator('input[type="email"]'),
-        page.locator('#email'),
+    # candidatos de campos
+    email_placeholders = ["Usuário ou e-mail", "Usuário ou e-mail", "E-mail", "Email", "Usuário", "Login"]
+    senha_placeholders = ["Senha", "Password"]
+
+    email_css = [
+        'input[placeholder*="e-mail" i]', 'input[placeholder*="email" i]',
+        'input[name="email"]', 'input[name="username"]', 'input[type="email"]', '#email'
     ]
-    pwd_locators = [
-        page.get_by_placeholder("Senha"),
-        page.locator('input[placeholder*="senha" i]'),
-        page.locator('input[type="password"]'),
-        page.locator('#password'),
+    senha_css = [
+        'input[placeholder*="senha" i]', 'input[type="password"]',
+        'input[name="password"]', '#password'
     ]
 
-    ok = False
-    for loc in email_locators:
+    # tenta localizar o campo de e-mail
+    email_loc = (await find_in_all_contexts(email_placeholders, by="placeholder")
+                 or await find_in_all_contexts(email_placeholders, by="label")
+                 or await find_in_all_contexts(email_css, by="css"))
+
+    # tenta localizar o campo de senha
+    senha_loc = (await find_in_all_contexts(senha_placeholders, by="placeholder")
+                 or await find_in_all_contexts(senha_placeholders, by="label")
+                 or await find_in_all_contexts(senha_css, by="css"))
+
+    # Se não encontrou de cara, clica no botão "Entrar" do topo (alguns temas mostram o form após esse clique)
+    if not (email_loc and senha_loc):
         try:
-            await loc.wait_for(timeout=8000)
-            await loc.fill(email)
-            ok = True
-            break
-        except: continue
-    if not ok:
+            await page.get_by_role("link", name=re.compile(r"Entrar|Login", re.I)).first.click(timeout=1200)
+            await page.wait_for_timeout(600)
+        except: 
+            pass
+        # tenta de novo
+        email_loc = email_loc or (await find_in_all_contexts(email_placeholders, by="placeholder")
+                                  or await find_in_all_contexts(email_placeholders, by="label")
+                                  or await find_in_all_contexts(email_css, by="css"))
+        senha_loc = senha_loc or (await find_in_all_contexts(senha_placeholders, by="placeholder")
+                                  or await find_in_all_contexts(senha_placeholders, by="label")
+                                  or await find_in_all_contexts(senha_css, by="css"))
+
+    # debug se ainda não achou
+    if not email_loc or not senha_loc:
         out_dir.mkdir(exist_ok=True)
         await page.screenshot(path=str(out_dir / "debug_login.png"), full_page=True)
         (out_dir / "debug_login.html").write_text(await page.content(), encoding="utf-8")
-        raise RuntimeError('Não achei "Usuário ou e-mail" (veja downloads/debug_login.*).')
+        raise RuntimeError('Não achei campos de login. Veja downloads/debug_login.*')
 
-    for loc in pwd_locators:
+    # garantir visibilidade e foco
+    try: await email_loc.scroll_into_view_if_needed(timeout=800)
+    except: pass
+    await email_loc.click(timeout=1500)
+    try:
+        await email_loc.fill(email, timeout=2000)
+    except:
+        # fallback por JS
         try:
-            await loc.fill(password); break
-        except: continue
-
-    for bsel in ['button:has-text("Login")', 'button[type="submit"]', 'button:has-text("Entrar")']:
-        try:
-            await page.locator(bsel).first.click(timeout=1500)
-            break
+            handle = await email_loc.element_handle()
+            await page.evaluate("(el, val)=>{el.value=''; el.focus(); el.value=val; el.dispatchEvent(new Event('input',{bubbles:true}));}", handle, email)
         except: pass
 
-    # Espera cair no dashboard
-    await page.wait_for_url(re.compile(r".*/#dashboard/.*"), timeout=12000)
+    try: await senha_loc.scroll_into_view_if_needed(timeout=800)
+    except: pass
+    await senha_loc.click(timeout=1500)
+    try:
+        await senha_loc.fill(password, timeout=2000)
+    except:
+        try:
+            handle = await senha_loc.element_handle()
+            await page.evaluate("(el, val)=>{el.value=''; el.focus(); el.value=val; el.dispatchEvent(new Event('input',{bubbles:true}));}", handle, password)
+        except: pass
+
+    # clicar no botão de login
+    clicked = False
+    for bsel in [
+        'button[type="submit"]',
+        'button:has-text("Login")',
+        'button:has-text("Entrar")',
+        'text=/^Login$/',
+        'text=/^Entrar$/',
+    ]:
+        try:
+            await (page.locator(bsel) if bsel.startswith('button') else page.locator(bsel)).first.click(timeout=1200)
+            clicked = True
+            break
+        except:
+            continue
+
+    if not clicked:
+        # ENTER no campo de senha como último recurso
+        try:
+            await senha_loc.press("Enter", timeout=800)
+        except: pass
+
+    # aguarda cair no dashboard
+    try:
+        await page.wait_for_url(re.compile(r".*/#dashboard/.*"), timeout=12000)
+    except PWTimeout:
+        await page.screenshot(path=str(out_dir / "debug_after_submit.png"), full_page=True)
+        (out_dir / "debug_after_submit.html").write_text(await page.content(), encoding="utf-8")
+        raise RuntimeError("Login não completou. Veja downloads/debug_after_submit.*")
+
 
 # Bloqueia recursos pesados/3rd-party para acelerar
+# substitua o router existente por este:
 BLOCK_EXT = (".png",".jpg",".jpeg",".gif",".webp",".svg",".mp4",".webm",".woff",".woff2",".ttf",".otf",".eot")
+
+def should_block(req: Request) -> bool:
+    url = req.url.lower()
+    # na tela de login, não bloqueie nada além de mídia/arquivos pesados
+    return any(url.endswith(ext) for ext in BLOCK_EXT)
+
 BLOCK_HOSTS = ("google-analytics", "facebook", "segment", "hotjar", "doubleclick", "googletagmanager")
 
 def should_block(req: Request) -> bool:
